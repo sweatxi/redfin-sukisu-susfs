@@ -19,6 +19,8 @@ services:
       EVOLUTION_STAGE: ${EVOLUTION_STAGE:-susfs}
       SUKISU_DRIVER_VERSION: ${SUKISU_DRIVER_VERSION:-40900}
       ENABLE_SUSFS: ${ENABLE_SUSFS:-0}
+      KSU_VARIANT: ${KSU_VARIANT:-}
+      APPLY_ONLY: ${APPLY_ONLY:-0}
       PACKAGE_ARTIFACT_DIR: ${PACKAGE_ARTIFACT_DIR:-/workspace/artifacts/stock-sukisu}
       LTO: ${LTO:-thin}
       BUILD_CONFIG: ${BUILD_CONFIG:-build.config.redbull.sukisu}

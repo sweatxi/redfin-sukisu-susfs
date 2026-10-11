@@ -7,6 +7,7 @@ set -Eeuo pipefail
 }
 target=${BUILD_TARGET:-stock}
 export BUILD_TARGET="$target"
+ksu_variant=${KSU_VARIANT:-}
 build_stage=${EVOLUTION_STAGE:-susfs}
 if [[ "$target" == evolution ]]; then
   case "$build_stage" in
@@ -37,9 +38,14 @@ artifact_dir=${PACKAGE_ARTIFACT_DIR:-}
 export OUT_DIR=${OUT_DIR:-/stock-out}
 export DIST_DIR=${DIST_DIR:-$OUT_DIR/dist}
 export ARTIFACT_DIR=$OUT_DIR
-export BUILD_CONFIG=${BUILD_CONFIG:-build.config.redbull.sukisu}
+if [[ "$ksu_variant" == resukisu ]]; then
+  export BUILD_CONFIG=${BUILD_CONFIG:-build.config.redbull.resukisu}
+else
+  export BUILD_CONFIG=${BUILD_CONFIG:-build.config.redbull.sukisu}
+fi
 case "$target:$build_stage:$BUILD_CONFIG" in
   stock:*:build.config.redbull.sukisu | \
+    stock:*:build.config.redbull.resukisu | \
     evolution:plain:build.config.redbull.evolution.plain | \
     evolution:sukisu-minimal:build.config.redbull.evolution.sukisu-minimal | \
     evolution:sukisu:build.config.redbull.evolution.sukisu | \
@@ -165,11 +171,22 @@ SUSFS=not-integrated
 EVOLUTION_KERNEL_REVISION=$expected_commit
 EOF
   printf 'Building plain Evolution kernel; SukiSU and SUSFS are disabled for the boot gate.\n'
+elif [[ "$ksu_variant" == resukisu ]]; then
+  python3 "/workspace/scripts/apply-resukisu-inline.py"
 else
   python3 "/workspace/scripts/apply-sukisu-susfs.py"
 fi
 
-if [[ "$ENABLE_SUSFS" == 1 ]]; then
+if [[ "${APPLY_ONLY:-0}" == 1 ]]; then
+  printf 'Apply-only run finished; integration lock:\n'
+  cat "$OUT_DIR/sukisu-susfs.lock"
+  exit 0
+fi
+
+if [[ "$ksu_variant" == resukisu ]]; then
+  printf 'Building %s redbull kernel with ReSukiSU (SUSFS inline hook) and adapted SUSFS 4.19 integration.\n' \
+    "$rom_version"
+elif [[ "$ENABLE_SUSFS" == 1 ]]; then
   printf 'Building %s redbull kernel with SukiSU Ultra v4.2.0 and SUSFS 1.5.5 integration.\n' \
     "$rom_version"
 else

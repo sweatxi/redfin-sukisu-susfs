@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+"""Apply the ReSukiSU (SUSFS inline-hook) integration to the pinned stock kernel.
+
+This is the resukisu variant of apply-sukisu-susfs.py. The driver is ReSukiSU
+built in `CONFIG_KSU_SUSFS` mode ("SUSFS Inline Hook") instead of SukiSU-Ultra
+manual-hook mode:
+
+ 1. Clone the pinned ReSukiSU revision into the staged sources.
+ 2. Wire the driver into the kernel tree: copy `kernel/` to drivers/kernelsu and
+    add the drivers/Kconfig + drivers/Makefile entries.
+ 3. Apply the adapted SUSFS 4.19 kernel patch committed under patches/resukisu
+    (modern SUSFS API adapted to Linux 4.19; matches ReSukiSU's kernel-side
+    expectations, including sus_map / avc-log spoofing / sdcard monitor).
+ 4. Inject the ksu_handle_* call sites ReSukiSU checks for at compile time.
+    Inline-hook mode has no manual-hook auto hooks, so every call site must be
+    present in the kernel source and must NOT carry CONFIG_KSU_MANUAL_HOOK
+    guards (see ReSukiSU kernel/tools/inline_hook_check.mk).
+ 5. Record the integration lock.
+
+The kernel tree is the synced disposable checkout under $KERNEL_DIR.
+"""
+
+import hashlib
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+
+REPO = pathlib.Path(__file__).resolve().parents[1]
+
+RESUKISU_REPO = "https://github.com/ESK-Project/ReSukiSU.git"
+RESUKISU_REF = os.environ.get(
+    "RESUKISU_EXPECTED_REF", "e04defa03ee32c1e07ef9ad3f6be6ebefcf698ca"
+)
+RESUKISU_SOURCE_DIR = pathlib.Path(
+    os.environ.get("RESUKISU_SOURCE_DIR", "/stock/sources/resukisu")
+)
+SUSFS_PATCH = REPO / "patches/resukisu/50_add_susfs_in_kernel-4.19-adapted.patch"
+
+KERNEL_DIR = pathlib.Path(os.environ.get("KERNEL_DIR", "/stock/private/msm-google"))
+OUT_DIR = pathlib.Path(os.environ.get("OUT_DIR", "/stock-out"))
+
+GIT_ENV = {
+    **os.environ,
+    "GIT_OPTIONAL_LOCKS": "0",
+    "GIT_TERMINAL_PROMPT": "0",
+}
+
+
+def log(message):
+    print(f"[resukisu-inline] {message}", flush=True)
+
+
+def run(args, cwd=None, check=True, capture=True):
+    result = subprocess.run(
+        args,
+        cwd=cwd,
+        env=GIT_ENV,
+        check=False,
+        text=True,
+        capture_output=capture,
+    )
+    if check and result.returncode != 0:
+        if result.stdout:
+            print(result.stdout, file=sys.stderr)
+        if result.stderr:
+            print(result.stderr, file=sys.stderr)
+        raise RuntimeError(f"Command failed: {' '.join(str(a) for a in args)}")
+    return result
+
+
+def git(tree, *args, check=True):
+    return run(["git", "-C", str(tree), *args], check=check)
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def clone_resukisu():
+    if RESUKISU_SOURCE_DIR.exists():
+        shutil.rmtree(RESUKISU_SOURCE_DIR)
+    RESUKISU_SOURCE_DIR.parent.mkdir(parents=True, exist_ok=True)
+    log(f"Cloning {RESUKISU_REPO} at {RESUKISU_REF[:12]}")
+    run(["git", "clone", "--quiet", RESUKISU_REPO, str(RESUKISU_SOURCE_DIR)])
+    git(RESUKISU_SOURCE_DIR, "checkout", "--quiet", RESUKISU_REF)
+    head = git(RESUKISU_SOURCE_DIR, "rev-parse", "HEAD").stdout.strip()
+    if head != RESUKISU_REF:
+        raise RuntimeError(f"ReSukiSU ref mismatch: {head}")
+    return head
+
+
+def wire_driver():
+    source = RESUKISU_SOURCE_DIR / "kernel"
+    if not source.is_dir():
+        raise RuntimeError(f"ReSukiSU kernel/ directory is missing: {source}")
+
+    target = KERNEL_DIR / "drivers" / "kernelsu"
+    if target.exists():
+        shutil.rmtree(target)
+    shutil.copytree(source, target)
+    log(f"Copied ReSukiSU driver to {target.relative_to(KERNEL_DIR)}")
+
+    makefile = KERNEL_DIR / "drivers" / "Makefile"
+    text = makefile.read_text()
+    if "kernelsu" not in text:
+        anchor = "obj-$(CONFIG_SENSORS_SSC)\t+= sensors/"
+        if anchor in text:
+            text = text.replace(anchor, anchor + "\nobj-$(CONFIG_KSU)\t\t\t+= kernelsu/")
+        else:
+            text = text.rstrip("\n") + "\nobj-$(CONFIG_KSU)\t\t\t+= kernelsu/\n"
+        makefile.write_text(text)
+        log("drivers/Makefile: added kernelsu entry")
+    else:
+        log("drivers/Makefile: kernelsu entry already present")
+
+    kconfig = KERNEL_DIR / "drivers" / "Kconfig"
+    text = kconfig.read_text()
+    if "drivers/kernelsu/Kconfig" not in text:
+        index = text.rfind("\nendmenu")
+        if index < 0:
+            raise RuntimeError("drivers/Kconfig: endmenu anchor not found")
+        text = text[:index] + '\nsource "drivers/kernelsu/Kconfig"\n' + text[index:]
+        kconfig.write_text(text)
+        log("drivers/Kconfig: added kernelsu source")
+    else:
+        log("drivers/Kconfig: kernelsu source already present")
+
+
+def apply_susfs_patch():
+    if not SUSFS_PATCH.is_file():
+        raise RuntimeError(f"SUSFS patch is missing: {SUSFS_PATCH}")
+    log(f"Applying {SUSFS_PATCH.name} ({SUSFS_PATCH.stat().st_size} bytes)")
+
+    check = git(KERNEL_DIR, "apply", "--check", str(SUSFS_PATCH), check=False)
+    if check.returncode == 0:
+        git(KERNEL_DIR, "apply", str(SUSFS_PATCH))
+        log("SUSFS patch applied cleanly (git apply)")
+        return
+
+    check3 = git(KERNEL_DIR, "apply", "--check", "--3way", str(SUSFS_PATCH), check=False)
+    if check3.returncode == 0:
+        git(KERNEL_DIR, "apply", "--3way", str(SUSFS_PATCH))
+        log("SUSFS patch applied with 3-way merge")
+        return
+
+    log("git apply failed; retrying with patch --fuzz=3")
+    result = run(
+        ["patch", "-p1", "--fuzz=3", "--no-backup-if-mismatch", "-i", str(SUSFS_PATCH)],
+        cwd=KERNEL_DIR,
+        check=False,
+    )
+    print(result.stdout)
+    print(result.stderr, file=sys.stderr)
+    if result.returncode != 0:
+        raise RuntimeError(
+            "SUSFS patch did not apply cleanly; fix patches/resukisu/"
+            "50_add_susfs_in_kernel-4.19-adapted.patch for this kernel tree"
+        )
+    log("SUSFS patch applied with fuzz")
+
+
+class Injection:
+    """One compile-time call-site injection into a kernel source file."""
+
+    def __init__(self, relpath, marker, anchor, block, mode, expected):
+        self.relpath = relpath
+        self.marker = marker
+        self.anchor = anchor
+        self.block = block
+        self.mode = mode
+        self.expected = expected
+
+
+def guarded(inner):
+    return f"#ifdef CONFIG_KSU_SUSFS\n{inner}\n#endif\n"
+
+
+INJECTIONS = [
+    Injection(
+        "fs/exec.c",
+        "ksu_handle_execveat",
+        "\treturn __do_execve_file(fd, filename, argv, envp, flags, NULL);",
+        guarded(
+            "\t{\n"
+            "\t\textern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,\n"
+            "\t\t\t\t\t       void *argv, void *envp, int *flags);\n"
+            "\t\t(void)ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n"
+            "\t}\n"
+        ),
+        "before",
+        1,
+    ),
+    Injection(
+        "fs/open.c",
+        "ksu_handle_faccessat",
+        "\tint res;\n\tunsigned int lookup_flags = LOOKUP_FOLLOW;\n",
+        guarded(
+            "\t{\n"
+            "\t\textern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,\n"
+            "\t\t\t\t\t\tint *mode, int *__unused_flags);\n"
+            "\t\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n"
+            "\t}\n"
+        ),
+        "after",
+        1,
+    ),
+    Injection(
+        "fs/read_write.c",
+        "ksu_handle_sys_read",
+        "\treturn ksys_read(fd, buf, count);",
+        guarded(
+            "\t{\n"
+            "\t\textern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr,\n"
+            "\t\t\t\t\t       size_t *count_ptr);\n"
+            "\t\tksu_handle_sys_read(fd, &buf, &count);\n"
+            "\t}\n"
+        ),
+        "before",
+        None,
+    ),
+    Injection(
+        "fs/stat.c",
+        "ksu_handle_stat",
+        "\terror = vfs_fstatat(dfd, filename, &stat, flag);",
+        guarded(
+            "\t{\n"
+            "\t\textern int ksu_handle_stat(int *dfd, const char __user **filename_user,\n"
+            "\t\t\t\t\t   int *flags);\n"
+            "\t\tksu_handle_stat(&dfd, &filename, &flag);\n"
+            "\t}\n"
+        ),
+        "before",
+        None,
+    ),
+    Injection(
+        "kernel/sys.c",
+        "ksu_handle_setresuid",
+        "\tkuid_t kruid, keuid, ksuid;\n",
+        guarded(
+            "\t{\n"
+            "\t\textern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);\n"
+            "\t\t(void)ksu_handle_setresuid(ruid, euid, suid);\n"
+            "\t}\n"
+        ),
+        "after",
+        1,
+    ),
+    Injection(
+        "kernel/reboot.c",
+        "ksu_handle_sys_reboot",
+        "\t/* We only trust the superuser with rebooting the system. */",
+        "#ifdef CONFIG_KSU\n"
+        "\t{\n"
+        "\t\textern int ksu_handle_sys_reboot(int magic1, int magic2,\n"
+        "\t\t\t\t\t\t unsigned int cmd, void __user **arg);\n"
+        "\t\tint ksu_susfs_reboot_ret = ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n"
+        "\t\tif (ksu_susfs_reboot_ret)\n"
+        "\t\t\tgoto ksu_susfs_original_flow;\n"
+        "\t\treturn ksu_susfs_reboot_ret;\n"
+        "\t}\n"
+        "ksu_susfs_original_flow:\n"
+        "#endif\n",
+        "before",
+        1,
+    ),
+    Injection(
+        "drivers/input/input.c",
+        "ksu_handle_input_handle_event",
+        "\tint disposition = input_get_disposition(dev, type, code, &value);",
+        guarded(
+            "\t{\n"
+            "\t\textern int ksu_handle_input_handle_event(unsigned int *type,\n"
+            "\t\t\t\t\t\t\t unsigned int *code, int *value);\n"
+            "\t\tksu_handle_input_handle_event(&type, &code, &value);\n"
+            "\t}\n"
+        ),
+        "before",
+        1,
+    ),
+]
+
+
+def inject_call_sites():
+    for spec in INJECTIONS:
+        path = KERNEL_DIR / spec.relpath
+        text = path.read_text()
+        if spec.marker in text:
+            log(f"{spec.relpath}: {spec.marker} already present, skipping")
+            continue
+        count = text.count(spec.anchor)
+        if count == 0:
+            raise RuntimeError(
+                f"{spec.relpath}: anchor for {spec.marker} not found; "
+                "kernel tree drifted"
+            )
+        if spec.expected is not None and count != spec.expected:
+            raise RuntimeError(
+                f"{spec.relpath}: expected {spec.expected} anchor(s) for "
+                f"{spec.marker}, found {count}"
+            )
+        if spec.mode == "before":
+            text = text.replace(spec.anchor, spec.block + spec.anchor)
+        else:
+            text = text.replace(spec.anchor, spec.anchor + spec.block)
+        path.write_text(text)
+        log(f"{spec.relpath}: injected {spec.marker} ({count} site(s))")
+
+
+def write_lock(resukisu_head):
+    lock_path = OUT_DIR / "sukisu-susfs.lock"
+    fields = [
+        ("INTEGRATION_MODE", "resukisu-susfs-inline"),
+        ("KSU_DRIVER", "ReSukiSU"),
+        ("KSU_REPO", RESUKISU_REPO),
+        ("KSU_REF", resukisu_head),
+        ("KSU_HOOK_MODE", "CONFIG_KSU_SUSFS (SUSFS Inline Hook)"),
+        ("SUSFS_PATCH", str(SUSFS_PATCH.relative_to(REPO))),
+        ("SUSFS_PATCH_SHA256", sha256_file(SUSFS_PATCH)),
+        ("SUSFS_KERNEL_REF", "simonpunk susfs4ksu kernel-4.19 adapted (Kevin233B/TALIH-PD2)"),
+        ("KERNEL_DIR", str(KERNEL_DIR)),
+    ]
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text("".join(f"{key}={value}\n" for key, value in fields))
+    log(f"Wrote {lock_path}")
+    print(lock_path.read_text())
+
+
+def main():
+    if not KERNEL_DIR.is_dir():
+        print(f"Error: kernel tree is missing: {KERNEL_DIR}", file=sys.stderr)
+        return 1
+    try:
+        resukisu_head = clone_resukisu()
+        wire_driver()
+        apply_susfs_patch()
+        inject_call_sites()
+        write_lock(resukisu_head)
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

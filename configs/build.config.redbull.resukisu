@@ -1,0 +1,77 @@
+# shellcheck shell=bash
+# The AOSP build framework supplies variables and consumes this configuration.
+# shellcheck disable=SC2034,SC2154
+# Stock redbull 4.19 kernel with ReSukiSU (SUSFS Inline Hook mode).
+KERNEL_DIR=private/msm-google
+# shellcheck disable=SC1090
+. "${ROOT_DIR}/${KERNEL_DIR}/build.config.redbull.vintf"
+
+BUILD_BOOT_IMG=
+BUILD_INITRAMFS=0
+EXT_MODULES=
+EXT_MODULES_MAKEFILE=
+POST_DEFCONFIG_CMDS="update_config && enable_resukisu"
+
+enable_resukisu() {
+  # ReSukiSU driver in CONFIG_KSU_SUSFS ("SUSFS Inline Hook") mode: no
+  # CONFIG_KSU_MANUAL_HOOK, no CONFIG_KSU_MANUAL_SU, no kprobes/tracepoints.
+  "${KERNEL_DIR}/scripts/config" --file "${OUT_DIR}/.config" \
+    -e KSU \
+    -e KSU_SUSFS \
+    -d KSU_MANUAL_HOOK \
+    -d KSU_TRACEPOINT_HOOK \
+    -d KPROBES \
+    -d KRETPROBES \
+    -d FTRACE_SYSCALLS \
+    -e KALLSYMS \
+    -e KALLSYMS_ALL \
+    -d KPM \
+    -e KSU_SUSFS_SUS_PATH \
+    -e KSU_SUSFS_SUS_MOUNT \
+    -e KSU_SUSFS_SUS_KSTAT \
+    -e KSU_SUSFS_SPOOF_UNAME \
+    -e KSU_SUSFS_ENABLE_LOG \
+    -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+    -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+    -e KSU_SUSFS_OPEN_REDIRECT \
+    -e KSU_SUSFS_SUS_MAP
+
+  # MAKE_ARGS is the AOSP build framework's word list.
+  # shellcheck disable=SC2086
+  (cd "${OUT_DIR}" &&
+    make O="${OUT_DIR}" CLANG_TRIPLE="${CLANG_TRIPLE}" \
+      CROSS_COMPILE="${CROSS_COMPILE}" "${TOOL_ARGS[@]}" ${MAKE_ARGS} olddefconfig)
+
+  grep -Fqx 'CONFIG_KSU=y' "${OUT_DIR}/.config" || {
+    echo 'Error: CONFIG_KSU=y is missing after olddefconfig.' >&2
+    return 1
+  }
+  grep -Fqx 'CONFIG_KSU_SUSFS=y' "${OUT_DIR}/.config" || {
+    echo 'Error: CONFIG_KSU_SUSFS=y (SUSFS Inline Hook) is missing after olddefconfig.' >&2
+    return 1
+  }
+  grep -Fqx '# CONFIG_KSU_MANUAL_HOOK is not set' "${OUT_DIR}/.config" || {
+    echo 'Error: CONFIG_KSU_MANUAL_HOOK must stay disabled in inline-hook mode.' >&2
+    return 1
+  }
+  grep -Fqx '# CONFIG_KPROBES is not set' "${OUT_DIR}/.config" || {
+    echo 'Error: CONFIG_KPROBES must be disabled for this target.' >&2
+    return 1
+  }
+  grep -Fqx 'CONFIG_KALLSYMS=y' "${OUT_DIR}/.config" || {
+    echo 'Error: CONFIG_KALLSYMS=y is missing after olddefconfig.' >&2
+    return 1
+  }
+  grep -Fqx 'CONFIG_KALLSYMS_ALL=y' "${OUT_DIR}/.config" || {
+    echo 'Error: CONFIG_KALLSYMS_ALL=y is missing after olddefconfig.' >&2
+    return 1
+  }
+  grep -Fqx 'CONFIG_KSU_SUSFS_SUS_PATH=y' "${OUT_DIR}/.config" || {
+    echo 'Error: CONFIG_KSU_SUSFS_SUS_PATH=y is missing after olddefconfig.' >&2
+    return 1
+  }
+  grep -Fqx 'CONFIG_KSU_SUSFS_SUS_MOUNT=y' "${OUT_DIR}/.config" || {
+    echo 'Error: CONFIG_KSU_SUSFS_SUS_MOUNT=y is missing after olddefconfig.' >&2
+    return 1
+  }
+}

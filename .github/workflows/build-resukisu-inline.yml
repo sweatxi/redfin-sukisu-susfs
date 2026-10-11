@@ -1,0 +1,138 @@
+name: Build redfin ReSukiSU SUSFS-inline kernel
+
+on:
+  push:
+    branches: [resukisu-inline]
+  workflow_dispatch:
+    inputs:
+      apply_only:
+        description: Only run sync + integration (no kernel compile)
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: redfin-resukisu-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  STOCK_APPROVED_BOOT_SHA256: ''
+  KSU_VARIANT: resukisu
+  APPLY_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.apply_only && '1' || '0' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          submodules: recursive
+
+      - name: Validate pins and project tests
+        run: |
+          set -Eeuo pipefail
+          python3 -m unittest discover -s scripts -p 'test_*.py'
+          python3 -m py_compile scripts/*.py
+          for script in scripts/*.sh; do
+            bash -n "$script"
+          done
+          python3 scripts/sync-stock.py --validate-only
+          docker compose config --quiet
+
+      - name: Build the pinned Docker image
+        run: docker compose build stock-build
+
+      - name: Build and package redfin ReSukiSU artifacts
+        env:
+          JOBS: 3
+          SKIP_MRPROPER: 0
+          PACKAGE_ARTIFACT_DIR: /workspace/artifacts/resukisu-inline
+        run: docker compose run --rm stock-build
+
+      - name: Verify ReSukiSU artifacts
+        if: env.APPLY_ONLY != '1'
+        run: |
+          set -Eeuo pipefail
+          test -s artifacts/resukisu-inline/AnyKernel-redfin-sukisu.zip
+          test -s artifacts/resukisu-inline/boot.img
+          test -s artifacts/resukisu-inline/fastboot/boot.img
+          test -s artifacts/resukisu-inline/source-lock.json
+          test -s artifacts/resukisu-inline/sukisu-susfs.lock
+          cmp artifacts/resukisu-inline/boot.img artifacts/resukisu-inline/fastboot/boot.img
+          unzip -t artifacts/resukisu-inline/AnyKernel-redfin-sukisu.zip
+          (cd artifacts/resukisu-inline && sha256sum -c SHA256SUMS)
+          grep -Fqx 'CONFIG_KSU=y' artifacts/resukisu-inline/kernel.config
+          grep -Fqx 'CONFIG_KSU_SUSFS=y' artifacts/resukisu-inline/kernel.config
+          grep -Fqx '# CONFIG_KSU_MANUAL_HOOK is not set' artifacts/resukisu-inline/kernel.config
+          test "$(grep -c 'susfs\.o' artifacts/resukisu-inline/build.log)" -ge 1
+          grep -F 'Integration mode: resukisu-susfs-inline' artifacts/resukisu-inline/sukisu-susfs.lock || grep -F 'INTEGRATION_MODE=resukisu-susfs-inline' artifacts/resukisu-inline/sukisu-susfs.lock
+
+      - name: Publish GitHub Release
+        if: env.APPLY_ONLY != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: redfin-resukisu-${{ github.sha }}
+        run: |
+          set -Eeuo pipefail
+          artifact=artifacts/resukisu-inline
+
+          release_title="redfin ReSukiSU + SUSFS-inline $GITHUB_SHA"
+          release_notes="redfin 4.19 kernel with ReSukiSU (SUSFS Inline Hook mode) and the adapted SUSFS 4.19 patch. Test with fastboot boot before flashing.
+
+          Source commit: $GITHUB_SHA"
+          assets=(
+            artifacts/resukisu-inline/AnyKernel-redfin-sukisu.zip
+            artifacts/resukisu-inline/boot.img
+            artifacts/resukisu-inline/boot.json
+            artifacts/resukisu-inline/SHA256SUMS
+            artifacts/resukisu-inline/sukisu-susfs.lock
+            artifacts/resukisu-inline/source-lock.json
+            artifacts/resukisu-inline/factory.sha256
+          )
+
+          release_json=$(gh release view "$TAG_NAME" \
+            --json tagName,targetCommitish,name,assets 2> /dev/null || true)
+          if [[ -z "$release_json" ]]; then
+            if ! gh release create "$TAG_NAME" \
+              --target "$GITHUB_SHA" \
+              --title "$release_title" \
+              --notes "$release_notes"; then
+              # Another run may have created the same commit release concurrently.
+              release_json=$(gh release view "$TAG_NAME" \
+                --json tagName,targetCommitish,name,assets) || {
+                printf 'Could not create or inspect release %s.\n' "$TAG_NAME" >&2
+                exit 1
+              }
+            else
+              release_json=$(gh release view "$TAG_NAME" \
+                --json tagName,targetCommitish,name,assets)
+            fi
+          fi
+
+          if ! printf '%s\n' "$release_json" | python3 -c 'import json,sys; r=json.load(sys.stdin); tag,commit,title=sys.argv[1:]; valid=r["tagName"]==tag and r["targetCommitish"]==commit and r["name"]==title; sys.exit(0 if valid else 1)' \
+            "$TAG_NAME" "$GITHUB_SHA" "$release_title"; then
+            printf 'Release %s exists but does not match this build; leaving it untouched.\n' \
+              "$TAG_NAME" >&2
+            exit 1
+          fi
+
+          release_tmp=$(mktemp -d)
+          trap 'rm -rf "$release_tmp"' EXIT
+          for asset in "${assets[@]}"; do
+            asset_name=${asset##*/}
+            if printf '%s\n' "$release_json" | python3 -c 'import json,sys; r=json.load(sys.stdin); name=sys.argv[1]; sys.exit(0 if any(a["name"]==name for a in r["assets"]) else 1)' \
+              "$asset_name"; then
+              gh release download "$TAG_NAME" --pattern "$asset_name" --dir "$release_tmp"
+              if ! cmp -s "$asset" "$release_tmp/$asset_name"; then
+                printf 'Release asset %s differs from this build; refusing to overwrite it.\n' \
+                  "$asset_name" >&2
+                exit 1
+              fi
+              printf 'Release asset %s already matches; leaving it unchanged.\n' "$asset_name"
+            else
+              gh release upload "$TAG_NAME" "$asset"
+            fi
+          done
