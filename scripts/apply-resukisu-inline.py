@@ -124,6 +124,9 @@ def patch_kbuild_for_o_builds(checkout):
         log("Kbuild: added KSU_SRC fallback for out-of-tree builds")
 
     resolved = pathlib.Path(os.path.realpath(fallback_path))
+    link = KERNEL_DIR / "drivers" / "kernelsu"
+    if not os.path.islink(link):
+        raise RuntimeError(f"drivers/kernelsu is not a symlink after wiring: {link}")
     if not (resolved.parent / ".git").exists():
         raise RuntimeError(
             f"KSU_SRC/../.git expectation is not satisfied: {resolved.parent}/.git missing"
@@ -441,8 +444,8 @@ def main():
         return 1
     try:
         checkout = clone_resukisu()
-        patch_kbuild_for_o_builds(checkout)
         wire_driver(checkout)
+        patch_kbuild_for_o_builds(checkout)
         apply_susfs_patch()
         verify_patch_result()
         inject_call_sites()
