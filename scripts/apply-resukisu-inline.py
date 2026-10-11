@@ -92,6 +92,36 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
+def patch_kbuild_for_o_builds(checkout):
+    """Make ReSukiSU's Kbuild work under the AOSP out-of-tree build layout.
+
+    The clean pass includes this Kbuild through a relative path that the
+    kbuild framework resolves against the output tree, so the Kbuild's
+    `$(realpath ...)` for KSU_SRC comes back empty and the git-submodule
+    check hard-fails during `make clean`. Fall back to the in-tree source
+    location when the realpath is empty.
+    """
+    kbuild = checkout / "kernel" / "Kbuild"
+    text = kbuild.read_text()
+    anchor = "KSU_SRC := $(realpath $(dir $(abspath $(lastword $(MAKEFILE_LIST)))))\n"
+    if "KSU_SRC := $(srctree)/drivers/kernelsu" in text:
+        log("Kbuild: KSU_SRC fallback already present")
+        return
+    if anchor not in text:
+        raise RuntimeError("Kbuild: KSU_SRC anchor not found; ReSukiSU layout changed")
+    fallback = (
+        anchor
+        + "# redfin out-of-tree builds: the clean pass includes this Kbuild via a\n"
+        + "# relative path resolved against the output tree, so the realpath above\n"
+        + "# can be empty. Fall back to the in-tree source location.\n"
+        + "ifeq ($(KSU_SRC),)\n"
+        + "KSU_SRC := $(realpath $(srctree)/drivers/kernelsu)\n"
+        + "endif\n"
+    )
+    kbuild.write_text(text.replace(anchor, fallback))
+    log("Kbuild: added empty-KSU_SRC fallback for out-of-tree builds")
+
+
 def clone_resukisu():
     """Clone ReSukiSU into the kernel tree; returns the checkout directory."""
     checkout = RESUKISU_SOURCE_DIR
@@ -402,6 +432,7 @@ def main():
         return 1
     try:
         checkout = clone_resukisu()
+        patch_kbuild_for_o_builds(checkout)
         wire_driver(checkout)
         apply_susfs_patch()
         verify_patch_result()

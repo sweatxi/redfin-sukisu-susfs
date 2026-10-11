@@ -23,7 +23,7 @@ services:
       APPLY_ONLY: ${APPLY_ONLY:-0}
       PACKAGE_ARTIFACT_DIR: ${PACKAGE_ARTIFACT_DIR:-/workspace/artifacts/stock-sukisu}
       LTO: ${LTO:-thin}
-      BUILD_CONFIG: ${BUILD_CONFIG:-build.config.redbull.sukisu}
+      BUILD_CONFIG: ${BUILD_CONFIG:-}
       EVOLUTION_KERNEL_SOURCE: /evolution-kernel
       HOME: /tmp
       TMPDIR: /tmp
