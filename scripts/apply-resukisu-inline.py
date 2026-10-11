@@ -106,25 +106,25 @@ def patch_kbuild_for_o_builds(checkout):
     text = kbuild.read_text()
     anchor = "KSU_SRC := $(realpath $(dir $(abspath $(lastword $(MAKEFILE_LIST)))))\n"
     fallback_path = KERNEL_DIR / "drivers" / "kernelsu"
-    if "KSU_SRC fallback" in text:
+    if "KSU_SRC fallback for redfin" in text:
         log("Kbuild: KSU_SRC fallback already present")
     else:
         if anchor not in text:
             raise RuntimeError("Kbuild: KSU_SRC anchor not found; ReSukiSU layout changed")
         fallback = (
             anchor
-            + "# KSU_SRC fallback for redfin out-of-tree builds: the clean pass\n"
-            + "# resolves this Kbuild through the output tree, leaving the\n"
-            + "# realpath above empty.\n"
-            + "ifeq ($(KSU_SRC),)\n"
+            + "# KSU_SRC fallback for redfin out-of-tree builds: depending on how this\n"
+            + "# Kbuild is included (source tree vs the persistent output tree), the\n"
+            + "# derived KSU_SRC may resolve outside the driver's git checkout.\n"
+            + "ifeq ($(shell test -e $(KSU_SRC)/../.git && echo 1 || echo 0),0)\n"
             + f"KSU_SRC := $(realpath {fallback_path})\n"
             + "endif\n"
         )
         kbuild.write_text(text.replace(anchor, fallback))
         log("Kbuild: added KSU_SRC fallback for out-of-tree builds")
 
-    resolved = pathlib.Path(os.path.realpath(fallback_path))
     link = KERNEL_DIR / "drivers" / "kernelsu"
+    resolved = pathlib.Path(os.path.realpath(link))
     if not os.path.islink(link):
         raise RuntimeError(f"drivers/kernelsu is not a symlink after wiring: {link}")
     if not (resolved.parent / ".git").exists():
@@ -132,6 +132,30 @@ def patch_kbuild_for_o_builds(checkout):
             f"KSU_SRC/../.git expectation is not satisfied: {resolved.parent}/.git missing"
         )
     log(f"Kbuild check passed: KSU_SRC -> {resolved} (../.git present)")
+
+    probe_make = shutil.which("make")
+    if probe_make:
+        probe = pathlib.Path("/tmp/ksu_kbuild_probe.mk")
+        probe.write_text(
+            "include $(PROBE_KSU_BUILD)\n"
+            "$(info PROBE_MAKE_VERSION=$(MAKE_VERSION))\n"
+            "$(info PROBE_KSU_SRC=$(KSU_SRC))\n"
+            "$(info PROBE_LOCAL_GIT_EXISTS=$(LOCAL_GIT_EXISTS))\n"
+        )
+        result = run(
+            [probe_make, "-f", str(probe), f"PROBE_KSU_BUILD={KERNEL_DIR}/drivers/kernelsu/Kbuild"],
+            cwd=KERNEL_DIR,
+            check=False,
+        )
+        output = (result.stdout or "") + (result.stderr or "")
+        print(output)
+        if "PROBE_LOCAL_GIT_EXISTS=1" not in output:
+            raise RuntimeError(
+                "make probe failed: the Kbuild git check does not pass in-tree"
+            )
+        log("make probe passed: Kbuild git check is satisfied")
+    else:
+        log("make not available; skipping the Kbuild make probe")
 
 
 def clone_resukisu():
