@@ -46,7 +46,11 @@ GIT_ENV = {
     **os.environ,
     "GIT_OPTIONAL_LOCKS": "0",
     "GIT_TERMINAL_PROMPT": "0",
+    "GIT_NO_LAZY_FETCH": "0",
 }
+# build-redfin-sukisu.sh exports GIT_ALLOW_PROTOCOL=file for its hermetic
+# local staging; the ReSukiSU clone needs https.
+GIT_ENV.pop("GIT_ALLOW_PROTOCOL", None)
 
 
 def log(message):
