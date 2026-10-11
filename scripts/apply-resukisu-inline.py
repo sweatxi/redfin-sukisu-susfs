@@ -38,13 +38,14 @@ RESUKISU_REF = os.environ.get(
 KERNEL_DIR = pathlib.Path(os.environ.get("KERNEL_DIR", "/stock/private/msm-google"))
 OUT_DIR = pathlib.Path(os.environ.get("OUT_DIR", "/stock-out"))
 
-# ReSukiSU's Kbuild refuses a plain copy of kernel/: it requires the kernel
-# directory to live inside a git checkout (KSU_SRC/../.git). Clone the repo
-# into the kernel tree and point drivers/kernelsu at it, matching ReSukiSU's
-# official setup.sh layout.
+# ReSukiSU's Kbuild requires the kernel/ directory to live inside a git
+# checkout (it tests $(KSU_SRC)/../.git). Clone the full repo to
+# drivers/kernelsu and build drivers/kernelsu/kernel/ as the driver; all
+# real directories, no symlinks, so `make clean` cannot break the check.
 RESUKISU_SOURCE_DIR = pathlib.Path(
-    os.environ.get("RESUKISU_SOURCE_DIR", str(KERNEL_DIR / "KernelSU"))
+    os.environ.get("RESUKISU_SOURCE_DIR", str(KERNEL_DIR / "drivers" / "kernelsu"))
 )
+RESUKISU_DRIVER_SUBDIR = "kernel"
 SUSFS_PATCH = REPO / "patches/resukisu/50_add_susfs_in_kernel-4.19-adapted.patch"
 
 GIT_ENV = {
@@ -102,10 +103,10 @@ def patch_kbuild_for_o_builds(checkout):
     resolves the drivers/kernelsu -> KernelSU/kernel symlink, and verify the
     resulting KSU_SRC/../.git expectation right away.
     """
-    kbuild = checkout / "kernel" / "Kbuild"
+    kbuild = checkout / RESUKISU_DRIVER_SUBDIR / "Kbuild"
     text = kbuild.read_text()
     anchor = "KSU_SRC := $(realpath $(dir $(abspath $(lastword $(MAKEFILE_LIST)))))\n"
-    fallback_path = KERNEL_DIR / "drivers" / "kernelsu"
+    driver_dir = KERNEL_DIR / "drivers" / "kernelsu" / RESUKISU_DRIVER_SUBDIR
     if "KSU_SRC fallback for redfin" in text:
         log("Kbuild: KSU_SRC fallback already present")
     else:
@@ -113,20 +114,17 @@ def patch_kbuild_for_o_builds(checkout):
             raise RuntimeError("Kbuild: KSU_SRC anchor not found; ReSukiSU layout changed")
         fallback = (
             anchor
-            + "# KSU_SRC fallback for redfin out-of-tree builds: depending on how this\n"
-            + "# Kbuild is included (source tree vs the persistent output tree), the\n"
-            + "# derived KSU_SRC may resolve outside the driver's git checkout.\n"
+            + "# KSU_SRC fallback for redfin out-of-tree builds: depending on how\n"
+            + "# this Kbuild is included, the derived KSU_SRC may resolve outside\n"
+            + "# the driver's git checkout. Fall back to the in-tree driver dir.\n"
             + "ifeq ($(shell test -e $(KSU_SRC)/../.git && echo 1 || echo 0),0)\n"
-            + f"KSU_SRC := $(realpath {fallback_path})\n"
+            + f"KSU_SRC := $(realpath {driver_dir})\n"
             + "endif\n"
         )
         kbuild.write_text(text.replace(anchor, fallback))
         log("Kbuild: added KSU_SRC fallback for out-of-tree builds")
 
-    link = KERNEL_DIR / "drivers" / "kernelsu"
-    resolved = pathlib.Path(os.path.realpath(link))
-    if not os.path.islink(link):
-        raise RuntimeError(f"drivers/kernelsu is not a symlink after wiring: {link}")
+    resolved = pathlib.Path(os.path.realpath(driver_dir))
     if not (resolved.parent / ".git").exists():
         raise RuntimeError(
             f"KSU_SRC/../.git expectation is not satisfied: {resolved.parent}/.git missing"
@@ -143,7 +141,7 @@ def patch_kbuild_for_o_builds(checkout):
             "$(info PROBE_LOCAL_GIT_EXISTS=$(LOCAL_GIT_EXISTS))\n"
         )
         result = run(
-            [probe_make, "-f", str(probe), f"PROBE_KSU_BUILD={KERNEL_DIR}/drivers/kernelsu/Kbuild"],
+            [probe_make, "-f", str(probe), f"PROBE_KSU_BUILD={driver_dir}/Kbuild"],
             cwd=KERNEL_DIR,
             check=False,
         )
@@ -174,42 +172,32 @@ def clone_resukisu():
 
 
 def wire_driver(checkout):
-    source = checkout / "kernel"
+    source = checkout / RESUKISU_DRIVER_SUBDIR
     if not source.is_dir():
         raise RuntimeError(f"ReSukiSU kernel/ directory is missing: {source}")
-
-    driver_link = KERNEL_DIR / "drivers" / "kernelsu"
-    if driver_link.is_symlink():
-        driver_link.unlink()
-    elif driver_link.is_dir():
-        shutil.rmtree(driver_link)
-    elif driver_link.exists():
-        driver_link.unlink()
-    os.symlink("../KernelSU/kernel", driver_link)
-    log("drivers/kernelsu -> ../KernelSU/kernel (symlink)")
 
     makefile = KERNEL_DIR / "drivers" / "Makefile"
     text = makefile.read_text()
     if "kernelsu" not in text:
         anchor = "obj-$(CONFIG_SENSORS_SSC)\t+= sensors/"
         if anchor in text:
-            text = text.replace(anchor, anchor + "\nobj-$(CONFIG_KSU)\t\t\t+= kernelsu/")
+            text = text.replace(anchor, anchor + "\nobj-$(CONFIG_KSU)\t\t\t+= kernelsu/kernel/")
         else:
-            text = text.rstrip("\n") + "\nobj-$(CONFIG_KSU)\t\t\t+= kernelsu/\n"
+            text = text.rstrip("\n") + "\nobj-$(CONFIG_KSU)\t\t\t+= kernelsu/kernel/\n"
         makefile.write_text(text)
-        log("drivers/Makefile: added kernelsu entry")
+        log("drivers/Makefile: added kernelsu/kernel entry")
     else:
         log("drivers/Makefile: kernelsu entry already present")
 
     kconfig = KERNEL_DIR / "drivers" / "Kconfig"
     text = kconfig.read_text()
-    if "drivers/kernelsu/Kconfig" not in text:
+    if "drivers/kernelsu/kernel/Kconfig" not in text:
         index = text.rfind("\nendmenu")
         if index < 0:
             raise RuntimeError("drivers/Kconfig: endmenu anchor not found")
-        text = text[:index] + '\nsource "drivers/kernelsu/Kconfig"\n' + text[index:]
+        text = text[:index] + '\nsource "drivers/kernelsu/kernel/Kconfig"\n' + text[index:]
         kconfig.write_text(text)
-        log("drivers/Kconfig: added kernelsu source")
+        log("drivers/Kconfig: added kernelsu/kernel source")
     else:
         log("drivers/Kconfig: kernelsu source already present")
 
