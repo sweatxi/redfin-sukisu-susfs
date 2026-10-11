@@ -95,31 +95,40 @@ def sha256_file(path):
 def patch_kbuild_for_o_builds(checkout):
     """Make ReSukiSU's Kbuild work under the AOSP out-of-tree build layout.
 
-    The clean pass includes this Kbuild through a relative path that the
-    kbuild framework resolves against the output tree, so the Kbuild's
-    `$(realpath ...)` for KSU_SRC comes back empty and the git-submodule
-    check hard-fails during `make clean`. Fall back to the in-tree source
-    location when the realpath is empty.
+    The clean pass includes this Kbuild through a path the kbuild framework
+    resolves differently, so the Kbuild's `$(realpath ...)` for KSU_SRC comes
+    back empty and the git-submodule check hard-fails during `make clean`.
+    Fall back to the absolute in-tree location (known at apply time), which
+    resolves the drivers/kernelsu -> KernelSU/kernel symlink, and verify the
+    resulting KSU_SRC/../.git expectation right away.
     """
     kbuild = checkout / "kernel" / "Kbuild"
     text = kbuild.read_text()
     anchor = "KSU_SRC := $(realpath $(dir $(abspath $(lastword $(MAKEFILE_LIST)))))\n"
-    if "KSU_SRC := $(srctree)/drivers/kernelsu" in text:
+    fallback_path = KERNEL_DIR / "drivers" / "kernelsu"
+    if "KSU_SRC fallback" in text:
         log("Kbuild: KSU_SRC fallback already present")
-        return
-    if anchor not in text:
-        raise RuntimeError("Kbuild: KSU_SRC anchor not found; ReSukiSU layout changed")
-    fallback = (
-        anchor
-        + "# redfin out-of-tree builds: the clean pass includes this Kbuild via a\n"
-        + "# relative path resolved against the output tree, so the realpath above\n"
-        + "# can be empty. Fall back to the in-tree source location.\n"
-        + "ifeq ($(KSU_SRC),)\n"
-        + "KSU_SRC := $(realpath $(srctree)/drivers/kernelsu)\n"
-        + "endif\n"
-    )
-    kbuild.write_text(text.replace(anchor, fallback))
-    log("Kbuild: added empty-KSU_SRC fallback for out-of-tree builds")
+    else:
+        if anchor not in text:
+            raise RuntimeError("Kbuild: KSU_SRC anchor not found; ReSukiSU layout changed")
+        fallback = (
+            anchor
+            + "# KSU_SRC fallback for redfin out-of-tree builds: the clean pass\n"
+            + "# resolves this Kbuild through the output tree, leaving the\n"
+            + "# realpath above empty.\n"
+            + "ifeq ($(KSU_SRC),)\n"
+            + f"KSU_SRC := $(realpath {fallback_path})\n"
+            + "endif\n"
+        )
+        kbuild.write_text(text.replace(anchor, fallback))
+        log("Kbuild: added KSU_SRC fallback for out-of-tree builds")
+
+    resolved = pathlib.Path(os.path.realpath(fallback_path))
+    if not (resolved.parent / ".git").exists():
+        raise RuntimeError(
+            f"KSU_SRC/../.git expectation is not satisfied: {resolved.parent}/.git missing"
+        )
+    log(f"Kbuild check passed: KSU_SRC -> {resolved} (../.git present)")
 
 
 def clone_resukisu():
