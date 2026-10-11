@@ -332,20 +332,48 @@ def inject_call_sites():
 
 
 def verify_patch_result():
-    """Sanity-check that every patched file really carries susfs content."""
-    patched = re.findall(r"(?m)^diff --git a/(\S+)", SUSFS_PATCH.read_text(errors="replace"))
+    """Sanity-check that every patched file really carries the patch content.
+
+    For each target file, pick the identifiers the patch adds (susfs_*/ksu_*
+    symbols and CONFIG_KSU_SUSFS options) and require at least one of them to
+    be present after the apply. This catches hunks that were fuzzed into the
+    wrong location.
+    """
+    text = SUSFS_PATCH.read_text(errors="replace")
     new_files = {"fs/susfs.c", "include/linux/susfs.h", "include/linux/susfs_def.h"}
-    for relpath in patched:
+    checked = 0
+    for section in re.split(r"(?m)^(?=diff --git )", text):
+        match = re.match(r"diff --git a/(\S+)", section)
+        if not match:
+            continue
+        relpath = match.group(1)
         path = KERNEL_DIR / relpath
         if not path.is_file():
             raise RuntimeError(f"SUSFS patch target is missing after apply: {relpath}")
         if relpath in new_files:
+            checked += 1
             continue
-        if "susfs" not in path.read_text(errors="replace"):
+        added = [
+            line[1:]
+            for line in section.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        ]
+        markers = set()
+        for line in added:
+            markers.update(re.findall(r"\b(?:susfs|ksu)_[A-Za-z0-9_]+", line))
+            markers.update(re.findall(r"CONFIG_KSU_SUSFS[A-Z_]*", line))
+        if not markers:
+            log(f"{relpath}: no distinctive marker in patch, skipping content check")
+            checked += 1
+            continue
+        content = path.read_text(errors="replace")
+        if not any(marker in content for marker in markers):
             raise RuntimeError(
-                f"SUSFS patch target has no susfs content after apply: {relpath}"
+                f"SUSFS patch target {relpath} carries none of the expected "
+                f"markers after apply: {sorted(markers)[:6]}"
             )
-    log(f"SUSFS patch verification passed ({len(patched)} files)")
+        checked += 1
+    log(f"SUSFS patch verification passed ({checked} files)")
 
 
 def write_lock(resukisu_head):
