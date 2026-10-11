@@ -34,13 +34,18 @@ RESUKISU_REPO = "https://github.com/ESK-Project/ReSukiSU.git"
 RESUKISU_REF = os.environ.get(
     "RESUKISU_EXPECTED_REF", "e04defa03ee32c1e07ef9ad3f6be6ebefcf698ca"
 )
-RESUKISU_SOURCE_DIR = pathlib.Path(
-    os.environ.get("RESUKISU_SOURCE_DIR", "/stock/sources/resukisu")
-)
-SUSFS_PATCH = REPO / "patches/resukisu/50_add_susfs_in_kernel-4.19-adapted.patch"
 
 KERNEL_DIR = pathlib.Path(os.environ.get("KERNEL_DIR", "/stock/private/msm-google"))
 OUT_DIR = pathlib.Path(os.environ.get("OUT_DIR", "/stock-out"))
+
+# ReSukiSU's Kbuild refuses a plain copy of kernel/: it requires the kernel
+# directory to live inside a git checkout (KSU_SRC/../.git). Clone the repo
+# into the kernel tree and point drivers/kernelsu at it, matching ReSukiSU's
+# official setup.sh layout.
+RESUKISU_SOURCE_DIR = pathlib.Path(
+    os.environ.get("RESUKISU_SOURCE_DIR", str(KERNEL_DIR / "KernelSU"))
+)
+SUSFS_PATCH = REPO / "patches/resukisu/50_add_susfs_in_kernel-4.19-adapted.patch"
 
 GIT_ENV = {
     **os.environ,
@@ -88,28 +93,34 @@ def sha256_file(path):
 
 
 def clone_resukisu():
-    if RESUKISU_SOURCE_DIR.exists():
-        shutil.rmtree(RESUKISU_SOURCE_DIR)
-    RESUKISU_SOURCE_DIR.parent.mkdir(parents=True, exist_ok=True)
-    log(f"Cloning {RESUKISU_REPO} at {RESUKISU_REF[:12]}")
-    run(["git", "clone", "--quiet", RESUKISU_REPO, str(RESUKISU_SOURCE_DIR)])
-    git(RESUKISU_SOURCE_DIR, "checkout", "--quiet", RESUKISU_REF)
-    head = git(RESUKISU_SOURCE_DIR, "rev-parse", "HEAD").stdout.strip()
+    """Clone ReSukiSU into the kernel tree; returns the checkout directory."""
+    checkout = RESUKISU_SOURCE_DIR
+    if checkout.exists():
+        shutil.rmtree(checkout)
+    checkout.parent.mkdir(parents=True, exist_ok=True)
+    log(f"Cloning {RESUKISU_REPO} at {RESUKISU_REF[:12]} into {checkout}")
+    run(["git", "clone", "--quiet", RESUKISU_REPO, str(checkout)])
+    git(checkout, "checkout", "--quiet", RESUKISU_REF)
+    head = git(checkout, "rev-parse", "HEAD").stdout.strip()
     if head != RESUKISU_REF:
         raise RuntimeError(f"ReSukiSU ref mismatch: {head}")
-    return head
+    return checkout
 
 
-def wire_driver():
-    source = RESUKISU_SOURCE_DIR / "kernel"
+def wire_driver(checkout):
+    source = checkout / "kernel"
     if not source.is_dir():
         raise RuntimeError(f"ReSukiSU kernel/ directory is missing: {source}")
 
-    target = KERNEL_DIR / "drivers" / "kernelsu"
-    if target.exists():
-        shutil.rmtree(target)
-    shutil.copytree(source, target)
-    log(f"Copied ReSukiSU driver to {target.relative_to(KERNEL_DIR)}")
+    driver_link = KERNEL_DIR / "drivers" / "kernelsu"
+    if driver_link.is_symlink():
+        driver_link.unlink()
+    elif driver_link.is_dir():
+        shutil.rmtree(driver_link)
+    elif driver_link.exists():
+        driver_link.unlink()
+    os.symlink("../KernelSU/kernel", driver_link)
+    log("drivers/kernelsu -> ../KernelSU/kernel (symlink)")
 
     makefile = KERNEL_DIR / "drivers" / "Makefile"
     text = makefile.read_text()
@@ -163,6 +174,9 @@ def apply_susfs_patch():
     print(result.stdout)
     print(result.stderr, file=sys.stderr)
     if result.returncode != 0:
+        for rej in sorted(KERNEL_DIR.rglob("*.rej")):
+            print(f"--- reject file: {rej.relative_to(KERNEL_DIR)}", file=sys.stderr)
+            print(rej.read_text(errors="replace")[:4000], file=sys.stderr)
         raise RuntimeError(
             "SUSFS patch did not apply cleanly; fix patches/resukisu/"
             "50_add_susfs_in_kernel-4.19-adapted.patch for this kernel tree"
@@ -317,6 +331,23 @@ def inject_call_sites():
         log(f"{spec.relpath}: injected {spec.marker} ({count} site(s))")
 
 
+def verify_patch_result():
+    """Sanity-check that every patched file really carries susfs content."""
+    patched = re.findall(r"(?m)^diff --git a/(\S+)", SUSFS_PATCH.read_text(errors="replace"))
+    new_files = {"fs/susfs.c", "include/linux/susfs.h", "include/linux/susfs_def.h"}
+    for relpath in patched:
+        path = KERNEL_DIR / relpath
+        if not path.is_file():
+            raise RuntimeError(f"SUSFS patch target is missing after apply: {relpath}")
+        if relpath in new_files:
+            continue
+        if "susfs" not in path.read_text(errors="replace"):
+            raise RuntimeError(
+                f"SUSFS patch target has no susfs content after apply: {relpath}"
+            )
+    log(f"SUSFS patch verification passed ({len(patched)} files)")
+
+
 def write_lock(resukisu_head):
     lock_path = OUT_DIR / "sukisu-susfs.lock"
     fields = [
@@ -324,6 +355,7 @@ def write_lock(resukisu_head):
         ("KSU_DRIVER", "ReSukiSU"),
         ("KSU_REPO", RESUKISU_REPO),
         ("KSU_REF", resukisu_head),
+        ("KSU_CHECKOUT", str(RESUKISU_SOURCE_DIR)),
         ("KSU_HOOK_MODE", "CONFIG_KSU_SUSFS (SUSFS Inline Hook)"),
         ("SUSFS_PATCH", str(SUSFS_PATCH.relative_to(REPO))),
         ("SUSFS_PATCH_SHA256", sha256_file(SUSFS_PATCH)),
@@ -341,11 +373,12 @@ def main():
         print(f"Error: kernel tree is missing: {KERNEL_DIR}", file=sys.stderr)
         return 1
     try:
-        resukisu_head = clone_resukisu()
-        wire_driver()
+        checkout = clone_resukisu()
+        wire_driver(checkout)
         apply_susfs_patch()
+        verify_patch_result()
         inject_call_sites()
-        write_lock(resukisu_head)
+        write_lock(RESUKISU_REF)
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1
