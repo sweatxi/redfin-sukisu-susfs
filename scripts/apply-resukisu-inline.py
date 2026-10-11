@@ -107,22 +107,23 @@ def patch_kbuild_for_o_builds(checkout):
     text = kbuild.read_text()
     anchor = "KSU_SRC := $(realpath $(dir $(abspath $(lastword $(MAKEFILE_LIST)))))\n"
     driver_dir = KERNEL_DIR / "drivers" / "kernelsu" / RESUKISU_DRIVER_SUBDIR
-    if "KSU_SRC fallback for redfin" in text:
-        log("Kbuild: KSU_SRC fallback already present")
+    if "KSU_SRC := /stock" in text:
+        log("Kbuild: literal KSU_SRC already present")
     else:
         if anchor not in text:
             raise RuntimeError("Kbuild: KSU_SRC anchor not found; ReSukiSU layout changed")
-        fallback = (
-            anchor
-            + "# KSU_SRC fallback for redfin out-of-tree builds: depending on how\n"
-            + "# this Kbuild is included, the derived KSU_SRC may resolve outside\n"
-            + "# the driver's git checkout. Fall back to the in-tree driver dir.\n"
-            + "ifeq ($(shell test -e $(KSU_SRC)/../.git && echo 1 || echo 0),0)\n"
-            + f"KSU_SRC := $(realpath {driver_dir})\n"
-            + "endif\n"
+        # Replace the whole derivation with a literal absolute path: anything
+        # derived from MAKEFILE_LIST/realpath varies with how the kbuild
+        # framework includes this file (source vs output tree, parallel clean
+        # passes), and the Kbuild's git check hard-fails on a bad value.
+        literal = (
+            "# KSU_SRC literal for redfin builds: the kernel tree and driver\n"
+            "# paths are fixed by the build image, so avoid the fragile\n"
+            "# realpath derivation entirely.\n"
+            + f"KSU_SRC := {driver_dir}\n"
         )
-        kbuild.write_text(text.replace(anchor, fallback))
-        log("Kbuild: added KSU_SRC fallback for out-of-tree builds")
+        kbuild.write_text(text.replace(anchor, literal))
+        log(f"Kbuild: KSU_SRC pinned to {driver_dir}")
 
     resolved = pathlib.Path(os.path.realpath(driver_dir))
     if not (resolved.parent / ".git").exists():
@@ -152,6 +153,36 @@ def patch_kbuild_for_o_builds(checkout):
                 "make probe failed: the Kbuild git check does not pass in-tree"
             )
         log("make probe passed: Kbuild git check is satisfied")
+
+        # Reproduce the clean pass context (the step that kept failing):
+        # include the real scripts/Makefile.clean from the output tree with
+        # obj pointing at the driver and print what the Kbuild sees.
+        out_tree = pathlib.Path("/stock-out/private/msm-google")
+        out_tree.mkdir(parents=True, exist_ok=True)
+        clean_probe = pathlib.Path("/tmp/ksu_clean_ctx_probe.mk")
+        clean_probe.write_text(
+            f"include {KERNEL_DIR}/scripts/Makefile.clean\n"
+            "$(info CTX_KSU_SRC=[$(KSU_SRC)])\n"
+            "$(info CTX_LOCAL_GIT_EXISTS=[$(LOCAL_GIT_EXISTS)])\n"
+            "$(info CTX_LASTWORD=[$(lastword $(MAKEFILE_LIST))])\n"
+            "$(info CTX_DERIVED=[$(realpath $(dir $(abspath $(lastword $(MAKEFILE_LIST)))))])\n"
+            "$(info CTX_TEST=[$(shell test -e $(KSU_SRC)/../.git && echo 1 || echo 0)])\n"
+            ".PHONY: __ctxtest\n__ctxtest:\n\t@true\n"
+        )
+        result = run(
+            [probe_make, "-f", str(clean_probe), "obj=drivers/kernelsu/kernel",
+             f"srctree={KERNEL_DIR}", "__ctxtest"],
+            cwd=out_tree,
+            check=False,
+        )
+        output = (result.stdout or "") + (result.stderr or "")
+        print(output)
+        if "CTX_LOCAL_GIT_EXISTS=[1]" not in output:
+            raise RuntimeError(
+                "clean-context probe failed: the Kbuild git check would fail "
+                "during make clean (see CTX_* output above)"
+            )
+        log("clean-context probe passed")
     else:
         log("make not available; skipping the Kbuild make probe")
 
